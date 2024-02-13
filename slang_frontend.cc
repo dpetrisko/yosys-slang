@@ -175,10 +175,25 @@ static const RTLIL::SigSpec evaluate_lhs(RTLIL::Module *mod, const ast::Expressi
 	switch (expr.kind) {
 	case ast::ExpressionKind::NamedValue:
 		{
-			const ast::Symbol &sym = expr.as<ast::NamedValueExpression>().symbol;
-			RTLIL::Wire *wire = mod->wire(net_id(sym));
-			log_assert(wire);
-			ret = wire;
+			const ast::Symbol *sym = &expr.as<ast::NamedValueExpression>().symbol;
+			switch (sym->kind) {
+			case ast::SymbolKind::ModportPort:
+				sym = sym->as<ast::ModportPortSymbol>().internalSymbol;
+				/* fallthrough */
+
+			case ast::SymbolKind::Net:
+			case ast::SymbolKind::Variable:
+			case ast::SymbolKind::FormalArgument:
+				{
+					RTLIL::Wire *wire = mod->wire(net_id(*sym));
+					require(expr, wire);
+					log_assert(wire);
+					ret = wire;
+				}
+				break;
+			default:
+				unimplemented(*sym);
+			}
 		}
 		break;
 	case ast::ExpressionKind::RangeSelect:
@@ -393,15 +408,18 @@ static const RTLIL::SigSpec evaluate_rhs(RTLIL::Module *mod, const ast::Expressi
 	switch (expr.kind) {
 	case ast::ExpressionKind::NamedValue:
 		{
-			const ast::Symbol &sym = expr.as<ast::NamedValueExpression>().symbol;
+			const ast::Symbol *sym = &expr.as<ast::NamedValueExpression>().symbol;
 
-			switch (sym.kind) {
+			switch (sym->kind) {
+			case ast::SymbolKind::ModportPort:
+				sym = sym->as<ast::ModportPortSymbol>().internalSymbol;
+				/* fallthrough */
+
 			case ast::SymbolKind::Net:
 			case ast::SymbolKind::Variable:
 			case ast::SymbolKind::FormalArgument:
 				{
-					const auto &valsym = sym.as<ast::ValueSymbol>();
-					RTLIL::Wire *wire = mod->wire(net_id(sym));
+					RTLIL::Wire *wire = mod->wire(net_id(*sym));
 					log_assert(wire);
 					ret = wire;
 					if (ctx)
@@ -410,7 +428,7 @@ static const RTLIL::SigSpec evaluate_rhs(RTLIL::Module *mod, const ast::Expressi
 				break;
 			case ast::SymbolKind::Parameter:
 				{
-					auto &valsym = sym.as<ast::ValueSymbol>();
+					auto &valsym = sym->as<ast::ValueSymbol>();
 					require(valsym, valsym.getInitializer());
 					auto exprconst = valsym.getInitializer()->constant;
 					require(valsym, exprconst && exprconst->isInteger());
@@ -418,7 +436,7 @@ static const RTLIL::SigSpec evaluate_rhs(RTLIL::Module *mod, const ast::Expressi
 				}
 				break;
 			default:
-				unimplemented(sym);
+				unimplemented(*sym);
 			}
 		}
 		break;
@@ -545,10 +563,26 @@ static const RTLIL::SigSpec evaluate_rhs(RTLIL::Module *mod, const ast::Expressi
 	case ast::ExpressionKind::RangeSelect:
 		{
 			const ast::RangeSelectExpression &sel = expr.as<ast::RangeSelectExpression>();
-			require(expr, sel.getSelectionKind() == ast::RangeSelectionKind::Simple);
 			require(expr, sel.left().constant && sel.right().constant);
 			int left = sel.left().constant->integer().as<int>().value();
 			int right = sel.right().constant->integer().as<int>().value();
+			switch (sel.getSelectionKind()) {
+			case ast::RangeSelectionKind::Simple:
+				/* no-op */
+				break;
+			case ast::RangeSelectionKind::IndexedDown:
+				right = left - right + 1;
+				break;
+			case ast::RangeSelectionKind::IndexedUp:
+				{
+					int left_save = left;
+					left = left + right - 1;
+					right = left_save;
+				}
+				break;
+			default:
+				unimplemented(sel);
+			}
 			require(expr, sel.value().type->hasFixedRange());
 			auto range = sel.value().type->getFixedRange();
 			int raw_left = range.translateIndex(left);
@@ -557,6 +591,8 @@ static const RTLIL::SigSpec evaluate_rhs(RTLIL::Module *mod, const ast::Expressi
 			int stride = sel.value().type->getBitstreamWidth() / range.width();
 			ret = evaluate_rhs(mod, sel.value(), ctx).extract(raw_right * stride,
 												stride * (raw_left - raw_right + 1));
+			if (ret.size() != (int) expr.type->getBitstreamWidth())
+				unimplemented(expr);
 		}
 		break;
 	case ast::ExpressionKind::ElementSelect:
@@ -1428,25 +1464,158 @@ public:
 		}
 	}
 
+	void handle(const ast::InterfacePortSymbol &sym)
+	{
+		require(sym, !sym.isGeneric); // && sym.modport.empty());
+		auto pair = sym.getConnection();
+		//require(sym, !pair.second);
+		switch (pair.first->kind) {
+		case ast::SymbolKind::Instance:
+			{
+				const ast::InstanceSymbol &instance = pair.first->as<ast::InstanceSymbol>();
+				for (auto &member : instance.body.members()) {
+					switch (member.kind) {
+					case ast::SymbolKind::Variable:
+					case ast::SymbolKind::Net:
+						{
+							auto &valsym = member.as<ast::ValueSymbol>(); 
+							if (valsym.getType().isFixedSize()) {
+								auto *wire = mod->wire(net_id(valsym));
+								log_assert(wire);
+								wire->port_output = true;
+								wire->port_input = true;
+							}
+						}
+						break;
+					default:
+						break;
+					}
+				}
+			}
+			break;
+		case ast::SymbolKind::InstanceArray:
+			{
+				const ast::InstanceArraySymbol &array = pair.first->as<ast::InstanceArraySymbol>();
+				for (auto &member_ : array.members()) {
+					const ast::InstanceSymbol &instance = member_.as<ast::InstanceSymbol>();
+					for (auto &member : instance.body.members()) {
+						switch (member.kind) {
+						case ast::SymbolKind::Variable:
+						case ast::SymbolKind::Net:
+							{
+								auto &valsym = member.as<ast::ValueSymbol>(); 
+								if (valsym.getType().isFixedSize()) {
+									auto *wire = mod->wire(net_id(valsym));
+									if (!wire)
+										log_error("No such wire: %s in %s\n",
+													log_id(net_id(valsym)), log_id(mod));
+									log_assert(wire);
+									wire->port_output = true;
+									wire->port_input = true;
+								}
+							}
+							break;
+						default:
+							break;
+						}
+					}
+				}
+			}
+			break;
+		default:
+			unimplemented(*pair.first);
+		}
+	}
+
 	void handle(const ast::InstanceSymbol &sym)
 	{
+		if (sym.isInterface()) {
+			visitDefault(sym.body);
+			return;
+		}
+
 		require(sym, sym.isModule());
 		std::string modName;
 		sym.body.getHierarchicalPath(modName);
-		RTLIL::Cell *cell = mod->addCell(id(sym.name), id(modName));
-		for (auto *conn : sym.getPortConnections()) {
-			if (!conn->getExpression())
-				continue;
-			auto &expr = *conn->getExpression();
-			RTLIL::SigSpec signal;
-			if (expr.kind == ast::ExpressionKind::Assignment) {
-				auto &assign = expr.as<ast::AssignmentExpression>();
-				require(expr, assign.right().kind == ast::ExpressionKind::EmptyArgument);
-				signal = evaluate_lhs(mod, assign.left());
-			} else {
-				signal = evaluate_rhs(mod, expr, NULL);
+		RTLIL::Cell *cell = mod->addCell(id(modName), id(modName));
+		for (auto *conn : sym.getPortConnections())
+		switch (conn->port.kind) {
+		case ast::SymbolKind::Port:
+			{
+				if (!conn->getExpression())
+					continue;
+				auto &expr = *conn->getExpression();
+				RTLIL::SigSpec signal;
+				if (expr.kind == ast::ExpressionKind::Assignment) {
+					auto &assign = expr.as<ast::AssignmentExpression>();
+					require(expr, assign.right().kind == ast::ExpressionKind::EmptyArgument);
+					signal = evaluate_lhs(mod, assign.left());
+				} else {
+					signal = evaluate_rhs(mod, expr, NULL);
+				}
+				cell->setPort(net_id(conn->port), signal);
 			}
-			cell->setPort(net_id(conn->port), signal);
+			break;
+		case ast::SymbolKind::InterfacePort:
+			{
+				auto ifaceconn = conn->getIfaceConn();
+				//require(sym, !ifaceconn.second);
+				//if (ifaceconn.second)
+				//	unimplemented(*(ifaceconn.second));
+				auto kind = ifaceconn.first->kind;
+				switch (kind) {
+				case ast::SymbolKind::Instance:
+					{
+						const ast::InstanceSymbol &instance = ifaceconn.first->as<ast::InstanceSymbol>();
+						for (auto &member : instance.body.members()) {
+							switch (member.kind) {
+							case ast::SymbolKind::Variable:
+							case ast::SymbolKind::Net:
+								{
+									auto &valsym = member.as<ast::ValueSymbol>(); 
+									if (valsym.getType().isFixedSize()) {
+										auto *wire = mod->wire(net_id(valsym));
+										log_assert(wire);
+										cell->setPort(net_id(valsym), wire);
+									}
+								}
+								break;
+							default:
+								break;
+							}
+						}
+					}
+					break;
+				case ast::SymbolKind::InstanceArray:
+					{
+						const ast::InstanceArraySymbol &array = ifaceconn.first->as<ast::InstanceArraySymbol>();
+						for (auto &member_ : array.members()) {
+							const ast::InstanceSymbol &instance = member_.as<ast::InstanceSymbol>();
+							for (auto &member : instance.body.members()) {
+								switch (member.kind) {
+								case ast::SymbolKind::Variable:
+								case ast::SymbolKind::Net:
+									{
+										auto &valsym = member.as<ast::ValueSymbol>(); 
+										if (valsym.getType().isFixedSize()) {
+											auto *wire = mod->wire(net_id(valsym));
+											log_assert(wire);
+											cell->setPort(net_id(valsym), wire);
+										}
+									}
+									break;
+								default:
+									break;
+								}
+							}
+						}
+					}
+					break;
+				}
+			}
+			break;
+		default:
+			unimplemented(conn->port);
 		}
 		transfer_attrs(sym, cell);
 	}
@@ -1471,67 +1640,79 @@ public:
 
 	void handle(const ast::InstanceBodySymbol &sym)
 	{
-		auto wadd = ast::makeVisitor([&](auto& visitor, const ast::ValueSymbol &sym) {
-			if (sym.getType().isFixedSize()) {
-				auto w = mod->addWire(net_id(sym), sym.getType().getBitstreamWidth());
-				transfer_attrs(sym, w);
+		struct WireVisitor : std::function<void(const ast::ValueSymbol &sym, bool nonstatic, bool rtl)>,
+							 ast::ASTVisitor<WireVisitor, true, false> {
+			using Tf = std::function<void(const ast::ValueSymbol &sym, bool nonstatic, bool rtl)>;
+			bool visit_ifports;
+			WireVisitor(bool visit_ifports, Tf f)
+				: Tf(std::move(f)), visit_ifports(visit_ifports) {}
 
-				if (sym.kind == ast::SymbolKind::Variable &&
-						sym.as<ast::VariableSymbol>().lifetime != ast::VariableLifetime::Static)
-					w->attributes[id_slang_nonstatic] = true;
+			void handle(const ast::VariableSymbol &sym) {
+				(*this)(sym, sym.lifetime != ast::VariableLifetime::Static, sym.getType().isFixedSize());
 			}
-		}, [&](auto& visitor, const ast::InstanceSymbol& sym) {
-			/* do not descend into other modules */
-		}, [&](auto& visitor, const ast::GenerateBlockSymbol& sym) {
-			/* stop at uninstantiated generate blocks */
-			if (sym.isUninstantiated)
-				return;
-			visitor.visitDefault(sym);
-		});
-		sym.visit(wadd);
 
-		auto varinit = ast::makeVisitor([&](auto& visitor, const ast::VariableSymbol &sym) {
+			void handle(const ast::NetSymbol &sym) {
+				(*this)(sym, false, sym.getType().isFixedSize());
+			}
+
+			void handle(const ast::InstanceSymbol &sym) {
+				if (sym.isInterface())
+					visitDefault(sym.body);
+			}
+
+			void handle(const ast::GenerateBlockSymbol &sym) {
+				if (sym.isUninstantiated)
+					return;
+				visitDefault(sym);
+			}
+
+			void handle(const ast::InterfacePortSymbol& sym) {
+				if (!visit_ifports)
+					return;
+				require(sym, !sym.isGeneric);
+				auto pair = sym.getConnection();
+				//require(sym, !pair.second);
+				pair.first->visit(*this);
+				//visitDefault(*pair.first);
+				//require(sym, pair.first->kind == ast::SymbolKind::Instance);
+				//const ast::InstanceSymbol &instance = pair.first->as<ast::InstanceSymbol>();
+				//visitDefault(instance);
+			}
+
+		};
+
+		sym.visit(WireVisitor(true, [&](const ast::ValueSymbol &sym, bool nonstatic, bool rtl) {
+			if (!rtl)
+				return;
+			auto w = mod->addWire(net_id(sym), sym.getType().getBitstreamWidth());
+			transfer_attrs(sym, w);
+			if (nonstatic)
+				w->attributes[id_slang_nonstatic] = true;
+		}));
+
+		sym.visit(WireVisitor(false, [&](const ast::ValueSymbol &sym, bool nonstatic, bool rtl) {
+			if (nonstatic)
+				return;
 			slang::ConstantValue initval = nullptr;
 			if (sym.getInitializer())
 				initval = sym.getInitializer()->eval(initial_eval.context);
 			initial_eval.context.createLocal(&sym, initval);
-		}, [&](auto& visitor, const ast::InstanceSymbol& sym) {
-			/* do not descend into other modules */
-		}, [&](auto& visitor, const ast::ProceduralBlockSymbol& sym) {
-			/* do not descend into procedural blocks */
-		}, [&](auto& visitor, const ast::GenerateBlockSymbol& sym) {
-			/* stop at uninstantiated generate blocks */
-			if (sym.isUninstantiated)
-				return;
-			visitor.visitDefault(sym);
-		});
-		sym.visit(varinit);
+		}));
 
 		visitDefault(sym);
 
-		// now transfer the initializers from variables onto RTLIL wires
-		auto inittransfer = ast::makeVisitor([&](auto& visitor, const ast::VariableSymbol &sym) {
-			if (sym.getType().isFixedSize()) {
-				auto storage = initial_eval.context.findLocal(&sym);
-				log_assert(storage);
-				auto const_ = const_const(*storage);
-				if (!const_.is_fully_undef()) {
-					auto wire = mod->wire(net_id(sym));
-					log_assert(wire);
-					wire->attributes[RTLIL::ID::init] = const_;
-				}
-			}
-		}, [&](auto& visitor, const ast::InstanceSymbol& sym) {
-			/* do not descend into other modules */
-		}, [&](auto& visitor, const ast::ProceduralBlockSymbol& sym) {
-			/* do not descend into procedural blocks */
-		}, [&](auto& visitor, const ast::GenerateBlockSymbol& sym) {
-			/* stop at uninstantiated generate blocks */
-			if (sym.isUninstantiated)
+		sym.visit(WireVisitor(false, [&](const ast::ValueSymbol &sym, bool nonstatic, bool rtl) {
+			if (!rtl || nonstatic)
 				return;
-			visitor.visitDefault(sym);
-		});
-		sym.visit(inittransfer);
+			auto storage = initial_eval.context.findLocal(&sym);
+			log_assert(storage);
+			auto const_ = const_const(*storage);
+			if (!const_.is_fully_undef()) {
+				auto wire = mod->wire(net_id(sym));
+				log_assert(wire);
+				wire->attributes[RTLIL::ID::init] = const_;
+			}
+		}));
 
 		for (auto& diag : initial_eval.context.getAllDiagnostics())
         	global_diagengine->issue(diag);
@@ -1551,6 +1732,7 @@ public:
 	void handle(YS_MAYBE_UNUSED const ast::ParameterSymbol &sym) {}
 	void handle(YS_MAYBE_UNUSED const ast::TypeParameterSymbol &sym) {}
 	void handle(YS_MAYBE_UNUSED const ast::WildcardImportSymbol &sym) {}
+	void handle(YS_MAYBE_UNUSED const ast::ModportSymbol &sym) {}
 
 	void handle(const ast::VariableSymbol &sym) {}
 
@@ -1580,6 +1762,9 @@ public:
 
 	void handle(const ast::InstanceSymbol &symbol)
 	{
+		if (symbol.isInterface())
+			return;
+
 		std::string name{symbol.name};
 
 		if (symbol.name.empty()) {
